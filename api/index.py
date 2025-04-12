@@ -2,6 +2,10 @@ import os
 import json
 import logging
 from http.server import BaseHTTPRequestHandler
+import sys
+
+# Добавляем корень проекта в путь
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -35,51 +39,59 @@ WEBAPP_HOST = '0.0.0.0'  # или '127.0.0.1'
 WEBAPP_PORT = int(os.getenv('PORT', 8000))
 
 
-# Обработчик HTTP-запросов для Vercel
+# Обработчик для Vercel serverless функции
 class handler(BaseHTTPRequestHandler):
-    async def setup_webhook(self):
-        # Установка вебхука
-        webhook_info = await bot.get_webhook_info()
-        if webhook_info.url != WEBHOOK_URL:
-            await bot.set_webhook(
-                url=WEBHOOK_URL
-            )
-            logging.info(f"Webhook set to {WEBHOOK_URL}")
-
     def do_GET(self):
+        """Обработка GET-запросов"""
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write("Bot webhook is running!".encode())
-
+        self.wfile.write("Бот для ухода за растениями работает!".encode('utf-8'))
+    
     def do_POST(self):
+        """Обработка webhook-запросов от Telegram"""
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
         
-        try:
-            update = json.loads(post_data.decode('utf-8'))
-            logging.info(f"Received update: {update}")
-            
-            # Передаем обновление в диспетчер aiogram
-            process_update(update)
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": True}).encode())
-        except Exception as e:
-            logging.error(f"Error processing update: {e}")
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode())
+        logging.info(f"Получен POST запрос на {self.path}")
+        
+        if self.path == '/api/webhook':
+            try:
+                update_data = json.loads(post_data.decode('utf-8'))
+                logging.info(f"Получено обновление: {update_data}")
+                
+                # Обработка обновления через aiogram
+                from main import process_telegram_update
+                process_telegram_update(update_data)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode('utf-8'))
+                return
+            except Exception as e:
+                logging.error(f"Ошибка обработки обновления: {e}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode('utf-8'))
+                return
+        
+        # Для всех остальных путей
+        self.send_response(404)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": False, "error": "Not found"}).encode('utf-8'))
 
 
-async def process_update(update_json):
-    """Обрабатывает входящие обновления от Telegram API"""
-    update = types.Update(**update_json)
+# Вспомогательная функция для обработки Telegram обновлений
+async def process_update(update_data):
+    """Обрабатывает входящие обновления от Telegram"""
+    update = types.Update(**update_data)
+    
     Bot.set_current(bot)
     Dispatcher.set_current(dp)
+    
     await dp.process_update(update)
 
 

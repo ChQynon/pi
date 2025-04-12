@@ -182,4 +182,19 @@ async def process_plant_name(message: types.Message, state: FSMContext):
         await message.reply(reply_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     
     # Log user interaction
-    log_user_interaction(message.from_user, "plant_care", plant_name) 
+    log_user_interaction(message.from_user, "plant_care", plant_name)
+
+# Добавляем функцию для обработки обновлений от вебхука
+async def process_telegram_update(update_data):
+    """Обрабатывает входящие обновления от Telegram через webhook"""
+    from aiogram import Bot, types
+    from aiogram.dispatcher import Dispatcher
+    
+    update = types.Update(**update_data)
+    
+    # Устанавливаем текущий бот и диспетчер
+    Bot.set_current(bot)
+    Dispatcher.set_current(dp)
+    
+    # Обрабатываем обновление
+    await dp.process_update(update) 
