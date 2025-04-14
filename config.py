@@ -15,4 +15,13 @@ DB_NAME = os.getenv("DB_NAME", "info_bot_db")
 VITAMINS_COLLECTION = "vitamins"
 PLANTS_COLLECTION = "plants"
 USERS_COLLECTION = "users"
-FEEDBACK_COLLECTION = "feedback" 
+FEEDBACK_COLLECTION = "feedback"
+
+CHUTES_API_TOKEN = os.getenv('CHUTES_API_TOKEN')
+
+MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'media')
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp')
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+
+os.makedirs(MEDIA_DIR, exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True) 

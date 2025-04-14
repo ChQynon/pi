@@ -1,5 +1,4 @@
 from database import Database
-from plant_care_tips import plant_care_manager
 
 def load_initial_vitamin_data(db):
     """Load initial vitamin data into the database"""
@@ -86,35 +85,13 @@ def load_initial_plant_data(db):
     print(f"Loaded {len(plants_data)} plant care records")
 
 
-def initialize_plant_care_tips():
-    """Initialize the plant care tips database"""
-    # This will automatically load initial plant care tips if the database file doesn't exist
-    tips_count = len(plant_care_manager.get_all_tips())
-    print(f"Initialized plant care tips database with {tips_count} entries")
-    return tips_count
-
-
-def initialize_data():
-    """Initialize all data for the bot"""
-    try:
-        # Connect to the database
-        db = Database()
-        
-        # Load vitamins data
-        load_initial_vitamin_data(db)
-        
-        # Load plant care tips
-        load_initial_plant_data(db)
-        
-        # Initialize plant care tips database
-        initialize_plant_care_tips()
-        
-        print("Data initialization complete")
-        return True
-    except Exception as e:
-        print(f"Error initializing data: {e}")
-        return False
+def init_database():
+    """Initialize database with sample data"""
+    db = Database()
+    load_initial_vitamin_data(db)
+    load_initial_plant_data(db)
+    print("Database initialized successfully")
 
 
 if __name__ == "__main__":
-    initialize_data() 
+    init_database() 
