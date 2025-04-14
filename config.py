@@ -21,7 +21,9 @@ CHUTES_API_TOKEN = os.getenv('CHUTES_API_TOKEN')
 
 MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'media')
 TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp')
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 
 os.makedirs(MEDIA_DIR, exist_ok=True)
-os.makedirs(TEMP_DIR, exist_ok=True) 
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True) 
