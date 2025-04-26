@@ -1,19 +1,22 @@
 {
   "version": 2,
-  "functions": {
-    "api/index.py": {
-      "memory": 1024,
-      "maxDuration": 10
-    }
-  },
-  "routes": [
+  "builds": [
     {
-      "src": "/(.*)",
-      "dest": "api/index.py"
+      "src": "webhook.py",
+      "use": "@vercel/python"
     }
   ],
-  "github": {
-    "enabled": true,
-    "silent": true
+  "routes": [
+    {
+      "src": "/webhook/(.*)",
+      "dest": "webhook.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "webhook.py"
+    }
+  ],
+  "env": {
+    "PYTHONUNBUFFERED": "1"
   }
 } 

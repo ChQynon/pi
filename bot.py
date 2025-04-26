@@ -1,47 +1,42 @@
-import logging
-import re
-import asyncio
 import os
-import signal
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    CallbackQueryHandler,
-    ConversationHandler
-)
+import re
+import time
+import json
+import uuid
+import logging
+import asyncio
+import traceback
+import aiohttp
+import urllib.parse
+from typing import Dict, List, Union, Optional, Any, Tuple
+from datetime import datetime
 
-from config import BOT_TOKEN
-from database import Database
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery, PhotoSize, InlineKeyboardMarkup, 
+    InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, 
+    ReplyKeyboardRemove, InputFile, FSInputFile
+)
+from aiogram.filters import Command, StateFilter
+from aiogram.utils.formatting import Text, Bold
+
+from config import BOT_TOKEN, TEMP_DIR, MEDIA_DIR
+from ai_service import AIService
+from file_storage import FileStorage
 from keyboards import (
-    get_main_menu_keyboard, 
-    get_vitamins_menu_keyboard, 
-    get_plants_menu_keyboard,
-    get_faq_keyboard,
-    get_back_keyboard,
-    get_ai_consultant_keyboard,
-    get_cancel_keyboard,
-    get_problems_menu_keyboard,
-    get_ai_menu_keyboard,
-    get_plant_actions_keyboard
+    main_menu_keyboard, plant_menu_keyboard, vitamin_menu_keyboard,
+    vitamins_keyboard, create_plant_action_keyboard, get_back_keyboard,
+    create_search_result_keyboard, create_plant_problem_keyboard,
+    create_youtube_keyboard
 )
 from utils import (
-    format_vitamin_info, 
-    format_plant_tip, 
-    format_faq,
-    is_vitamin_query,
-    is_plant_query,
-    is_health_query,
-    is_ai_query,
-    get_file_url,
-    format_problem_analysis,
-    clean_markdown
+    download_image, format_plant_info, format_vitamin_info,
+    log_user_action, format_ai_response, rate_limit
 )
-from ai_service import AIService
 
 # Enable logging
 logging.basicConfig(
@@ -58,8 +53,8 @@ WAITING_FOR_PLANT_IMAGE = 3
 WAITING_FOR_PROBLEM_DESCRIPTION = 4
 WAITING_FOR_KNOWLEDGE_UPDATE_TOPIC = 5
 
-# Initialize database connection
-db = Database()
+# Initialize file storage
+file_storage = FileStorage()
 
 # Initialize AI service
 ai_service = AIService()
@@ -83,9 +78,9 @@ def escape_markdown(text, version=1):
     
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Message, context: FSMContext) -> None:
     """Send a message when the command /start is issued."""
-    user = update.effective_user
+    user = update.from_user
     
     # Create user in database if doesn't exist
     if user.username:
@@ -93,7 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         username = f"{user.first_name} {user.last_name if user.last_name else ''}"
     
-    db.register_user(user.id, username, user.first_name)
+    file_storage.register_user(user.id, username, user.first_name)
     
     welcome_message = (
         f"👋 Здравствуйте, {user.first_name}!\n\n"
@@ -106,15 +101,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     
     # Track user interaction
-    db.update_user_interaction(user.id, "start")
+    file_storage.update_user_interaction(user.id, "start")
     
-    await update.message.reply_markdown_v2(
+    await update.answer(
         escape_markdown(welcome_message, 2),
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=main_menu_keyboard()
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_command(update: Message, context: FSMContext) -> None:
     """Send a message when the command /help is issued."""
     help_text = (
         "*PLEXY* - Ваш информационный бот от *SAMGA_NIS*\n\n"
@@ -135,19 +130,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     
     # Track user interaction
-    user_id = update.effective_user.id
-    db.update_user_interaction(user_id, "help")
+    user_id = update.from_user.id
+    file_storage.update_user_interaction(user_id, "help")
     
-    await update.message.reply_markdown_v2(
+    await update.answer(
         escape_markdown(help_text, 2),
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=main_menu_keyboard()
     )
 
 
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text_message(update: Message, context: FSMContext) -> None:
     """Handler for text messages"""
-    text = update.message.text
-    user_id = update.effective_user.id
+    text = update.text
+    user_id = update.from_user.id
     
     # Check if the message is a menu button press
     if text == "🍏 Витамины и минералы":
@@ -164,13 +159,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await show_problems_menu(update, context)
     
     # Check if in conversation state
-    if context.user_data.get('state') == WAITING_FOR_GENERAL_QUESTION:
+    if context.get('state') == WAITING_FOR_GENERAL_QUESTION:
         await handle_ai_general_question(update, context, text)
         return
-    elif context.user_data.get('state') == WAITING_FOR_VITAMIN_QUERY:
+    elif context.get('state') == WAITING_FOR_VITAMIN_QUERY:
         await handle_ai_vitamin_recommendation(update, context, text)
         return
-    elif context.user_data.get('state') == WAITING_FOR_PROBLEM_DESCRIPTION:
+    elif context.get('state') == WAITING_FOR_PROBLEM_DESCRIPTION:
         await handle_problem_description(update, context, text)
         return
     
@@ -187,25 +182,25 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         if match:
             vitamin_name = match.group(1)
-            vitamin = db.get_vitamin_by_name(f"Витамин {vitamin_name}")
+            vitamin = file_storage.get_vitamin_by_name(f"Витамин {vitamin_name}")
             
             if vitamin:
-                await update.message.reply_text(
+                await update.answer(
                     format_vitamin_info(vitamin, detailed=True),
-                    parse_mode=ParseMode.MARKDOWN
+                    parse_mode='MarkdownV2'
                 )
-                db.update_user_interaction(user_id, "vitamins")
+                file_storage.update_user_interaction(user_id, "vitamins")
                 return
         
         # If no exact match, try search
-        results = db.search_vitamins(text)
+        results = file_storage.search_vitamins(text)
         
         if results:
             if len(results) == 1:
                 # If only one result, show detailed info
-                await update.message.reply_text(
+                await update.answer(
                     format_vitamin_info(results[0], detailed=True),
-                    parse_mode=ParseMode.MARKDOWN
+                    parse_mode='MarkdownV2'
                 )
             else:
                 # If multiple results, show list
@@ -213,9 +208,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 for i, result in enumerate(results[:5], 1):
                     reply += f"{i}. {result['name']}\n"
                 reply += "\nВыберите конкретный витамин или минерал для получения подробной информации."
-                await update.message.reply_text(reply)
+                await update.answer(reply)
             
-            db.update_user_interaction(user_id, "vitamins")
+            file_storage.update_user_interaction(user_id, "vitamins")
             return
     
     elif is_plant_query(text):
@@ -224,24 +219,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         for waste in waste_types:
             if waste in text.lower():
-                plant_tip = db.get_plant_tip_by_waste(waste)
+                plant_tip = file_storage.get_plant_tip_by_waste(waste)
                 if plant_tip:
-                    await update.message.reply_text(
+                    await update.answer(
                         format_plant_tip(plant_tip, detailed=True),
-                        parse_mode=ParseMode.MARKDOWN
+                        parse_mode='MarkdownV2'
                     )
-                    db.update_user_interaction(user_id, "plants")
+                    file_storage.update_user_interaction(user_id, "plants")
                     return
         
         # If no exact match, try search
-        results = db.search_plant_tips(text)
+        results = file_storage.search_plant_tips(text)
         
         if results:
             if len(results) == 1:
                 # If only one result, show detailed info
-                await update.message.reply_text(
+                await update.answer(
                     format_plant_tip(results[0], detailed=True),
-                    parse_mode=ParseMode.MARKDOWN
+                    parse_mode='MarkdownV2'
                 )
             else:
                 # If multiple results, show list
@@ -249,154 +244,154 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 for i, result in enumerate(results[:5], 1):
                     reply += f"{i}. {result['waste_type']}\n"
                 reply += "\nВыберите конкретный тип отходов для получения подробной информации."
-                await update.message.reply_text(reply)
+                await update.answer(reply)
             
-            db.update_user_interaction(user_id, "plants")
+            file_storage.update_user_interaction(user_id, "plants")
             return
     
     # If we got here, use AI to attempt to answer the question
     await handle_ai_general_question(update, context, text)
 
 
-async def show_vitamins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_vitamins_menu(update: Message, context: FSMContext) -> None:
     """Show vitamins menu"""
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "🍏 *Витамины и минералы*\n\nВыберите интересующий вас витамин или минерал:",
-            reply_markup=get_vitamins_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=vitamin_menu_keyboard(),
+            parse_mode='MarkdownV2'
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "🍏 *Витамины и минералы*\n\nВыберите интересующий вас витамин или минерал:",
-            reply_markup=get_vitamins_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=vitamin_menu_keyboard(),
+            parse_mode='MarkdownV2'
         )
     
-    user_id = update.effective_user.id
-    db.update_user_interaction(user_id, "vitamins")
+    user_id = update.from_user.id
+    file_storage.update_user_interaction(user_id, "vitamins")
 
 
-async def show_plants_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_plants_menu(update: Message, context: FSMContext) -> None:
     """Show plants menu"""
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "🌱 *Уход за растениями*\n\nВыберите тип бытовых отходов для получения информации:",
-            reply_markup=get_plants_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=plant_menu_keyboard(),
+            parse_mode='MarkdownV2'
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "🌱 *Уход за растениями*\n\nВыберите тип бытовых отходов для получения информации:",
-            reply_markup=get_plants_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=plant_menu_keyboard(),
+            parse_mode='MarkdownV2'
         )
     
-    user_id = update.effective_user.id
-    db.update_user_interaction(user_id, "plants")
+    user_id = update.from_user.id
+    file_storage.update_user_interaction(user_id, "plants")
 
 
-async def show_ai_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_ai_menu(update: Message, context: FSMContext) -> None:
     """Show the AI menu"""
-    user_id = update.effective_user.id
+    user_id = update.from_user.id
     
     # Track user interaction
-    db.update_user_interaction(user_id, "ai_menu")
+    file_storage.update_user_interaction(user_id, "ai_menu")
     
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "🤖 *PLEXY - Ваш консультант*\n\nКак я могу вам помочь сегодня?",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_ai_menu_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=ai_menu_keyboard()
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "🤖 *PLEXY - Ваш консультант*\n\nКак я могу вам помочь сегодня?",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_ai_menu_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=ai_menu_keyboard()
         )
 
 
-async def show_faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_faq(update: Message, context: FSMContext) -> None:
     """Show FAQ menu"""
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "❓ *Часто задаваемые вопросы*\n\nВыберите интересующий вас раздел:",
-            reply_markup=get_faq_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=faq_keyboard(),
+            parse_mode='MarkdownV2'
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "❓ *Часто задаваемые вопросы*\n\nВыберите интересующий вас раздел:",
-            reply_markup=get_faq_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=faq_keyboard(),
+            parse_mode='MarkdownV2'
         )
     
-    user_id = update.effective_user.id
-    db.update_user_interaction(user_id, "faq")
+    user_id = update.from_user.id
+    file_storage.update_user_interaction(user_id, "faq")
 
 
-async def start_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_feedback(update: Message, context: FSMContext) -> int:
     """Start feedback conversation"""
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "📝 *Обратная связь*\n\n"
             "Пожалуйста, напишите ваше предложение, замечание или пожелание. "
             "Это поможет нам улучшить бота.\n\n"
             "Чтобы отменить, отправьте /cancel",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode='MarkdownV2'
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "📝 *Обратная связь*\n\n"
             "Пожалуйста, напишите ваше предложение, замечание или пожелание. "
             "Это поможет нам улучшить бота.\n\n"
             "Чтобы отменить, отправьте /cancel",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode='MarkdownV2'
         )
     
     return FEEDBACK
 
 
-async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_feedback(update: Message, context: FSMContext) -> int:
     """Process the feedback"""
-    user_id = update.effective_user.id
-    feedback_text = update.message.text
+    user_id = update.from_user.id
+    feedback_text = update.text
     
     # Save feedback to database
-    db.add_feedback(user_id, feedback_text)
+    file_storage.add_feedback(user_id, feedback_text)
     
-    await update.message.reply_text(
+    await update.answer(
         "Спасибо за ваш отзыв! Мы обязательно учтем его при улучшении бота.",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=main_menu_keyboard()
     )
     
     return ConversationHandler.END
 
 
-async def cancel_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel_feedback(update: Message, context: FSMContext) -> int:
     """Cancel feedback conversation"""
-    await update.message.reply_text(
+    await update.answer(
         "Отправка отзыва отменена.",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=main_menu_keyboard()
     )
     
     return ConversationHandler.END
 
 
-async def cancel_operation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cancel_operation(update: Message, context: FSMContext) -> None:
     """Cancel any ongoing operation"""
-    query = update.callback_query
+    query = update.callback
     await query.answer()
     
     # Clear state
-    if 'state' in context.user_data:
-        del context.user_data['state']
+    if 'state' in context.get():
+        del context['state']
     
     await query.edit_message_text(
         "Операция отменена. Чем еще я могу помочь?",
@@ -404,43 +399,43 @@ async def cancel_operation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-async def start_ai_general_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_ai_general_question(update: Message, context: FSMContext) -> int:
     """Start AI general question conversation"""
-    context.user_data['state'] = WAITING_FOR_GENERAL_QUESTION
+    context['state'] = WAITING_FOR_GENERAL_QUESTION
     
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "💬 *Задайте вопрос PLEXY*\n\n"
             "Задайте любой вопрос о витаминах, растениях или здоровье, "
             "и я постараюсь дать точный и полезный ответ.\n\n"
             "Напишите ваш вопрос:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "💬 *Задайте вопрос PLEXY*\n\n"
             "Задайте любой вопрос о витаминах, растениях или здоровье, "
             "и я постараюсь дать точный и полезный ответ.\n\n"
             "Напишите ваш вопрос:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     
     return WAITING_FOR_GENERAL_QUESTION
 
 
-async def handle_ai_general_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question=None) -> None:
+async def handle_ai_general_question(update: Message, context: FSMContext, question=None) -> None:
     """Handle general AI questions"""
-    user_id = update.effective_user.id
-    user_question = question or update.message.text
+    user_id = update.from_user.id
+    user_question = question or update.text
     
     # Track user interaction
-    db.update_user_interaction(user_id, "ai_question", user_question)
+    file_storage.update_user_interaction(user_id, "ai_question", user_question)
     
     # Send "typing" indicator
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    await context.bot.send_chat_action(chat_id=update.chat.id, action='typing')
     
     try:
         # Get response from AI service
@@ -450,59 +445,59 @@ async def handle_ai_general_question(update: Update, context: ContextTypes.DEFAU
         response = clean_markdown(response)
         
         # Send the response
-        await update.message.reply_text(
+        await update.answer(
             response,
-            reply_markup=get_ai_menu_keyboard()
+            reply_markup=ai_menu_keyboard()
         )
     except Exception as e:
         logging.error(f"Error getting AI response: {str(e)}")
-        await update.message.reply_text(
+        await update.answer(
             "❌ Извините, произошла ошибка при обработке вашего вопроса. Пожалуйста, попробуйте переформулировать вопрос или повторите попытку позже.",
-            reply_markup=get_ai_menu_keyboard()
+            reply_markup=ai_menu_keyboard()
         )
 
 
-async def start_ai_vitamin_recommendation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_ai_vitamin_recommendation(update: Message, context: FSMContext) -> int:
     """Start AI vitamin recommendation conversation"""
-    context.user_data['state'] = WAITING_FOR_VITAMIN_QUERY
+    context['state'] = WAITING_FOR_VITAMIN_QUERY
     
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "💊 *Рекомендация витаминов*\n\n"
             "Опишите ваш запрос, симптомы или состояние, и искусственный интеллект "
             "предложит подходящие витамины и минералы.\n\n"
             "Например: 'Какие витамины нужны при авитаминозе' или 'Что принимать для повышения иммунитета'.\n\n"
             "Напишите ваш запрос:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "💊 *Рекомендация витаминов*\n\n"
             "Опишите ваш запрос, симптомы или состояние, и искусственный интеллект "
             "предложит подходящие витамины и минералы.\n\n"
             "Например: 'Какие витамины нужны при авитаминозе' или 'Что принимать для повышения иммунитета'.\n\n"
             "Напишите ваш запрос:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     
     return WAITING_FOR_VITAMIN_QUERY
 
 
-async def handle_ai_vitamin_recommendation(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None) -> None:
+async def handle_ai_vitamin_recommendation(update: Message, context: FSMContext, query=None) -> None:
     """Handle AI vitamin recommendation"""
     if not query:
-        query = update.message.text
+        query = update.text
     
     # Clear state
-    if 'state' in context.user_data:
-        del context.user_data['state']
+    if 'state' in context.get():
+        del context['state']
     
     # Send typing action
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
+        chat_id=update.chat.id,
         action='typing'
     )
     
@@ -514,19 +509,19 @@ async def handle_ai_vitamin_recommendation(update: Update, context: ContextTypes
     
     # Send response
     await context.bot.send_message(
-        chat_id=update.effective_chat.id,
+        chat_id=update.chat.id,
         text=response,
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode='MarkdownV2'
     )
 
 
-async def start_ai_plant_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_ai_plant_analysis(update: Message, context: FSMContext) -> int:
     """Start AI plant analysis conversation"""
-    context.user_data['state'] = WAITING_FOR_PLANT_IMAGE
+    context['state'] = WAITING_FOR_PLANT_IMAGE
     
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "📷 *Анализ растения*\n\n"
             "Отправьте фотографию растения, и искусственный интеллект:"
             "\n- Определит вид растения"
@@ -534,11 +529,11 @@ async def start_ai_plant_analysis(update: Update, context: ContextTypes.DEFAULT_
             "\n- Даст рекомендации по уходу"
             "\n- Расскажет о плюсах и минусах его выращивания\n\n"
             "Отправьте фотографию:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "📷 *Анализ растения*\n\n"
             "Отправьте фотографию растения, и искусственный интеллект:"
             "\n- Определит вид растения"
@@ -546,19 +541,19 @@ async def start_ai_plant_analysis(update: Update, context: ContextTypes.DEFAULT_
             "\n- Даст рекомендации по уходу"
             "\n- Расскажет о плюсах и минусах его выращивания\n\n"
             "Отправьте фотографию:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     
     return WAITING_FOR_PLANT_IMAGE
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_photo(update: Message, context: FSMContext) -> None:
     """Handle user photos"""
-    user_id = update.effective_user.id
+    user_id = update.from_user.id
     
     # Get best quality photo
-    photo_file = await update.message.photo[-1].get_file()
+    photo_file = await update.photo[-1].get_file()
     
     # Create temp directory if it doesn't exist
     if not os.path.exists("temp"):
@@ -571,10 +566,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await photo_file.download_to_drive(file_path)
     
     # Track user interaction
-    db.update_user_interaction(user_id, "photo_recognition")
+    file_storage.update_user_interaction(user_id, "photo_recognition")
     
     # Always process as plant identification
-    processing_message = await update.message.reply_text("🔍 PLEXY анализирует вашу фотографию растения...")
+    processing_message = await update.answer("🔍 PLEXY анализирует вашу фотографию растения...")
     
     try:
         # Get plant recognition from the service
@@ -584,7 +579,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # If recognition failed
             await processing_message.edit_text(
                 "❌ Не удалось распознать растение на фотографии. Пожалуйста, убедитесь, что растение хорошо видно и попробуйте снова.",
-                reply_markup=get_plants_menu_keyboard()
+                reply_markup=plant_menu_keyboard()
             )
             return
         
@@ -667,17 +662,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         # Delete processing message and send the result
         await processing_message.delete()
-        await update.message.reply_text(
+        await update.answer(
             plant_info_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_plant_actions_keyboard(plant_name) if plant_name != "Неизвестное растение" else get_plants_menu_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=create_plant_action_keyboard(plant_name) if plant_name != "Неизвестное растение" else plant_menu_keyboard()
         )
         
     except Exception as e:
         logging.error(f"Error in plant recognition: {str(e)}")
         await processing_message.edit_text(
             "❌ Произошла ошибка при анализе фотографии. Пожалуйста, попробуйте ещё раз позже.",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=main_menu_keyboard()
         )
     
     # Clean up - remove temporary file
@@ -685,33 +680,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         os.remove(file_path)
 
 
-async def show_problems_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_problems_menu(update: Message, context: FSMContext) -> None:
     """Show problems and solutions menu"""
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
+    if update.callback:
+        await update.callback.answer()
+        await update.callback.edit_message_text(
             "🔍 *Проблемы и решения*\n\nВыберите категорию проблем или опишите свою проблему для получения рекомендаций:",
-            reply_markup=get_problems_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=problems_menu_keyboard(),
+            parse_mode='MarkdownV2'
         )
     else:
-        await update.message.reply_text(
+        await update.answer(
             "🔍 *Проблемы и решения*\n\nВыберите категорию проблем или опишите свою проблему для получения рекомендаций:",
-            reply_markup=get_problems_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
+            reply_markup=problems_menu_keyboard(),
+            parse_mode='MarkdownV2'
         )
     
-    user_id = update.effective_user.id
-    db.update_user_interaction(user_id, "problems_solutions")
+    user_id = update.from_user.id
+    file_storage.update_user_interaction(user_id, "problems_solutions")
 
 
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_callback_query(update: CallbackQuery, context: FSMContext) -> None:
     """Handle callback queries from inline keyboards"""
     query = update.callback_query
     await query.answer()
     
     callback_data = query.data
-    user_id = update.effective_user.id
+    user_id = update.from_user.id
     
     # Cancel operation
     if callback_data == "cancel_operation":
@@ -721,7 +716,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if callback_data == "main_menu":
         await query.edit_message_text(
             "Выберите интересующий вас раздел или задайте вопрос:",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=main_menu_keyboard()
         )
     
     # Handle feedback
@@ -733,7 +728,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await show_vitamins_menu(update, context)
     
     elif callback_data == "vitamins_all":
-        vitamins = db.get_all_vitamins()
+        vitamins = file_storage.get_all_vitamins()
         text = "*Список витаминов и минералов:*\n\n"
         
         for vitamin in vitamins:
@@ -741,21 +736,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await query.edit_message_text(
             text,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode='MarkdownV2',
             reply_markup=get_back_keyboard("vitamins_menu")
         )
-        db.update_user_interaction(user_id, "vitamins")
+        file_storage.update_user_interaction(user_id, "vitamins")
     
     elif callback_data.startswith("vitamin_"):
         # Extract vitamin name
         name = "Витамин " + callback_data[8:].upper()
         
-        vitamin = db.get_vitamin_by_name(name)
+        vitamin = file_storage.get_vitamin_by_name(name)
         
         if vitamin:
             await query.edit_message_text(
                 format_vitamin_info(vitamin, detailed=True),
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode='MarkdownV2',
                 reply_markup=get_back_keyboard("vitamins_menu")
             )
         else:
@@ -764,18 +759,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=get_back_keyboard("vitamins_menu")
             )
         
-        db.update_user_interaction(user_id, "vitamins")
+        file_storage.update_user_interaction(user_id, "vitamins")
         
     elif callback_data.startswith("mineral_"):
         # Extract mineral name
         name = callback_data[8:].capitalize()
         
-        vitamin = db.get_vitamin_by_name(name)
+        vitamin = file_storage.get_vitamin_by_name(name)
         
         if vitamin:
             await query.edit_message_text(
                 format_vitamin_info(vitamin, detailed=True),
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode='MarkdownV2',
                 reply_markup=get_back_keyboard("vitamins_menu")
             )
         else:
@@ -784,14 +779,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=get_back_keyboard("vitamins_menu")
             )
         
-        db.update_user_interaction(user_id, "vitamins")
+        file_storage.update_user_interaction(user_id, "vitamins")
     
     # Plants section
     elif callback_data == "plants_menu":
         await show_plants_menu(update, context)
     
     elif callback_data == "plants_all":
-        plant_tips = db.get_all_plant_tips()
+        plant_tips = file_storage.get_all_plant_tips()
         text = "*Способы использования бытовых отходов для растений:*\n\n"
         
         for tip in plant_tips:
@@ -799,10 +794,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await query.edit_message_text(
             text,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode='MarkdownV2',
             reply_markup=get_back_keyboard("plants_menu")
         )
-        db.update_user_interaction(user_id, "plants")
+        file_storage.update_user_interaction(user_id, "plants")
     
     # Handle plant-specific actions
     elif callback_data.startswith("plant_info_"):
@@ -810,7 +805,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         plant_name = callback_data[11:]  # Remove "plant_info_" prefix
         
         # Try to get plant from database
-        plant = db.get_plant_by_name(plant_name)
+        plant = file_storage.get_plant_by_name(plant_name)
         
         if plant:
             # Format plant information
@@ -842,15 +837,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             
             await query.edit_message_text(
                 plant_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_plant_actions_keyboard(plant_name)
+                parse_mode='MarkdownV2',
+                reply_markup=create_plant_action_keyboard(plant_name)
             )
         else:
             # If plant not in database, use AI to get information
             prompt = f"Дай информацию о растении {plant_name}. Включи научное название, описание, особенности."
             
             # Send typing action
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.chat.id, action='typing')
             
             try:
                 response = await ai_service.generate_response(prompt, max_tokens=800)
@@ -858,24 +853,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 
                 await query.edit_message_text(
                     f"🌿 *Информация о растении*\n\n{response}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    parse_mode='MarkdownV2',
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
             except Exception as e:
                 logging.error(f"Error getting plant info: {e}")
                 await query.edit_message_text(
                     f"Не удалось получить подробную информацию о растении {plant_name}.",
-                    reply_markup=get_plants_menu_keyboard()
+                    reply_markup=plant_menu_keyboard()
                 )
         
-        db.update_user_interaction(user_id, "plant_info", plant_name)
+        file_storage.update_user_interaction(user_id, "plant_info", plant_name)
     
     elif callback_data.startswith("plant_water_"):
         # Extract plant name from callback data
         plant_name = callback_data[12:]  # Remove "plant_water_" prefix
         
         # Try to get plant from database
-        plant = db.get_plant_by_name(plant_name)
+        plant = file_storage.get_plant_by_name(plant_name)
         watering_info = None
         
         if plant and 'extra_data' in plant and 'watering' in plant['extra_data']:
@@ -884,15 +879,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if watering_info:
             await query.edit_message_text(
                 f"💧 *Полив для {plant_name}*\n\n{watering_info}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_plant_actions_keyboard(plant_name)
+                parse_mode='MarkdownV2',
+                reply_markup=create_plant_action_keyboard(plant_name)
             )
         else:
             # If watering info not in database, use AI to get information
             prompt = f"Как правильно поливать растение {plant_name}? Дай подробные рекомендации по поливу."
             
             # Send typing action
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.chat.id, action='typing')
             
             try:
                 response = await ai_service.generate_response(prompt, max_tokens=500)
@@ -900,24 +895,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 
                 await query.edit_message_text(
                     f"💧 *Полив для {plant_name}*\n\n{response}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    parse_mode='MarkdownV2',
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
             except Exception as e:
                 logging.error(f"Error getting watering info: {e}")
                 await query.edit_message_text(
                     f"Не удалось получить информацию о поливе для {plant_name}.",
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
         
-        db.update_user_interaction(user_id, "plant_water", plant_name)
+        file_storage.update_user_interaction(user_id, "plant_water", plant_name)
     
     elif callback_data.startswith("plant_light_"):
         # Extract plant name from callback data
         plant_name = callback_data[12:]  # Remove "plant_light_" prefix
         
         # Try to get plant from database
-        plant = db.get_plant_by_name(plant_name)
+        plant = file_storage.get_plant_by_name(plant_name)
         light_info = None
         
         if plant and 'extra_data' in plant and 'light' in plant['extra_data']:
@@ -926,15 +921,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if light_info:
             await query.edit_message_text(
                 f"☀️ *Освещение для {plant_name}*\n\n{light_info}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_plant_actions_keyboard(plant_name)
+                parse_mode='MarkdownV2',
+                reply_markup=create_plant_action_keyboard(plant_name)
             )
         else:
             # If light info not in database, use AI to get information
             prompt = f"Какое освещение требуется для растения {plant_name}? Дай подробные рекомендации."
             
             # Send typing action
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.chat.id, action='typing')
             
             try:
                 response = await ai_service.generate_response(prompt, max_tokens=500)
@@ -942,24 +937,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 
                 await query.edit_message_text(
                     f"☀️ *Освещение для {plant_name}*\n\n{response}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    parse_mode='MarkdownV2',
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
             except Exception as e:
                 logging.error(f"Error getting light info: {e}")
                 await query.edit_message_text(
                     f"Не удалось получить информацию об освещении для {plant_name}.",
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
         
-        db.update_user_interaction(user_id, "plant_light", plant_name)
+        file_storage.update_user_interaction(user_id, "plant_light", plant_name)
     
     elif callback_data.startswith("plant_temp_"):
         # Extract plant name from callback data
         plant_name = callback_data[11:]  # Remove "plant_temp_" prefix
         
         # Try to get plant from database
-        plant = db.get_plant_by_name(plant_name)
+        plant = file_storage.get_plant_by_name(plant_name)
         temp_info = None
         
         if plant and 'extra_data' in plant and 'temperature' in plant['extra_data']:
@@ -968,15 +963,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if temp_info:
             await query.edit_message_text(
                 f"🌡️ *Температура для {plant_name}*\n\n{temp_info}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_plant_actions_keyboard(plant_name)
+                parse_mode='MarkdownV2',
+                reply_markup=create_plant_action_keyboard(plant_name)
             )
         else:
             # If temperature info not in database, use AI to get information
             prompt = f"Какая температура требуется для растения {plant_name}? Дай подробные рекомендации."
             
             # Send typing action
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.chat.id, action='typing')
             
             try:
                 response = await ai_service.generate_response(prompt, max_tokens=500)
@@ -984,24 +979,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 
                 await query.edit_message_text(
                     f"🌡️ *Температура для {plant_name}*\n\n{response}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    parse_mode='MarkdownV2',
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
             except Exception as e:
                 logging.error(f"Error getting temperature info: {e}")
                 await query.edit_message_text(
                     f"Не удалось получить информацию о температуре для {plant_name}.",
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
         
-        db.update_user_interaction(user_id, "plant_temperature", plant_name)
+        file_storage.update_user_interaction(user_id, "plant_temperature", plant_name)
     
     elif callback_data.startswith("plant_soil_"):
         # Extract plant name from callback data
         plant_name = callback_data[11:]  # Remove "plant_soil_" prefix
         
         # Try to get plant from database
-        plant = db.get_plant_by_name(plant_name)
+        plant = file_storage.get_plant_by_name(plant_name)
         soil_info = None
         
         if plant and 'extra_data' in plant and 'soil' in plant['extra_data']:
@@ -1010,15 +1005,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if soil_info:
             await query.edit_message_text(
                 f"🌱 *Почва для {plant_name}*\n\n{soil_info}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_plant_actions_keyboard(plant_name)
+                parse_mode='MarkdownV2',
+                reply_markup=create_plant_action_keyboard(plant_name)
             )
         else:
             # If soil info not in database, use AI to get information
             prompt = f"Какая почва требуется для растения {plant_name}? Дай подробные рекомендации."
             
             # Send typing action
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.chat.id, action='typing')
             
             try:
                 response = await ai_service.generate_response(prompt, max_tokens=500)
@@ -1026,24 +1021,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 
                 await query.edit_message_text(
                     f"🌱 *Почва для {plant_name}*\n\n{response}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    parse_mode='MarkdownV2',
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
             except Exception as e:
                 logging.error(f"Error getting soil info: {e}")
                 await query.edit_message_text(
                     f"Не удалось получить информацию о почве для {plant_name}.",
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    reply_markup=create_plant_action_keyboard(plant_name)
                 )
         
-        db.update_user_interaction(user_id, "plant_soil", plant_name)
+        file_storage.update_user_interaction(user_id, "plant_soil", plant_name)
     
     elif callback_data.startswith("plant_problems_"):
         # Extract plant name from callback data
         plant_name = callback_data[15:]  # Remove "plant_problems_" prefix
         
         # Try to get plant from database
-        plant = db.get_plant_by_name(plant_name)
+        plant = file_storage.get_plant_by_name(plant_name)
         problems_info = None
         
         if plant and 'extra_data' in plant and 'common_problems' in plant['extra_data']:
@@ -1052,15 +1047,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if problems_info:
             await query.edit_message_text(
                 f"🩺 *Проблемы и болезни {plant_name}*\n\n{problems_info}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_plant_actions_keyboard(plant_name)
+                parse_mode='MarkdownV2',
+                reply_markup=create_plant_problem_keyboard(plant_name)
             )
         else:
             # If problems info not in database, use AI to get information
             prompt = f"Какие распространенные проблемы и болезни бывают у растения {plant_name}? Дай подробное описание и методы лечения."
             
             # Send typing action
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+            await context.bot.send_chat_action(chat_id=update.chat.id, action='typing')
             
             try:
                 response = await ai_service.generate_response(prompt, max_tokens=600)
@@ -1068,17 +1063,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 
                 await query.edit_message_text(
                     f"🩺 *Проблемы и болезни {plant_name}*\n\n{response}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    parse_mode='MarkdownV2',
+                    reply_markup=create_plant_problem_keyboard(plant_name)
                 )
             except Exception as e:
                 logging.error(f"Error getting problems info: {e}")
                 await query.edit_message_text(
                     f"Не удалось получить информацию о проблемах для {plant_name}.",
-                    reply_markup=get_plant_actions_keyboard(plant_name)
+                    reply_markup=create_plant_problem_keyboard(plant_name)
                 )
         
-        db.update_user_interaction(user_id, "plant_problems", plant_name)
+        file_storage.update_user_interaction(user_id, "plant_problems", plant_name)
     
     elif callback_data.startswith("waste_"):
         waste_type = callback_data[6:].replace("_", " ")
@@ -1092,12 +1087,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         elif waste_type == "tea":
             waste_type = "чайная заварка"
         
-        plant_tip = db.get_plant_tip_by_waste(waste_type)
+        plant_tip = file_storage.get_plant_tip_by_waste(waste_type)
         
         if plant_tip:
             await query.edit_message_text(
                 format_plant_tip(plant_tip, detailed=True),
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode='MarkdownV2',
                 reply_markup=get_back_keyboard("plants_menu")
             )
         else:
@@ -1106,7 +1101,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=get_back_keyboard("plants_menu")
             )
         
-        db.update_user_interaction(user_id, "plants")
+        file_storage.update_user_interaction(user_id, "plants")
     
     # AI Consultant section
     elif callback_data == "ai_consultant_menu":
@@ -1129,7 +1124,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if faq_text:
             await query.edit_message_text(
                 faq_text,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode='MarkdownV2',
                 reply_markup=get_back_keyboard("faq_menu")
             )
         else:
@@ -1138,7 +1133,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=get_back_keyboard("faq_menu")
             )
         
-        db.update_user_interaction(user_id, "faq")
+        file_storage.update_user_interaction(user_id, "faq")
         
     elif callback_data == "faq_menu":
         await show_faq(update, context)
@@ -1147,17 +1142,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif callback_data == "problems_menu":
         await show_problems_menu(update, context)
     elif callback_data in ["vitamin_problems", "plant_problems"]:
-        context.user_data['problem_type'] = "vitamin" if callback_data == "vitamin_problems" else "plant"
+        context['problem_type'] = "vitamin" if callback_data == "vitamin_problems" else "plant"
         return await start_problem_description(update, context)
 
 
-async def start_problem_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_problem_description(update: Message, context: FSMContext) -> int:
     """Start problem description conversation"""
-    problem_type = context.user_data.get('problem_type', 'general')
-    context.user_data['state'] = WAITING_FOR_PROBLEM_DESCRIPTION
+    problem_type = context.get('problem_type', 'general')
+    context['state'] = WAITING_FOR_PROBLEM_DESCRIPTION
     
-    if update.callback_query:
-        await update.callback_query.answer()
+    if update.callback:
+        await update.callback.answer()
         if problem_type == "vitamin":
             message = (
                 "🔍 *Проблемы с витаминами*\n\n"
@@ -1183,10 +1178,10 @@ async def start_problem_description(update: Update, context: ContextTypes.DEFAUL
                 "Опишите вашу проблему:"
             )
         
-        await update.callback_query.edit_message_text(
+        await update.callback.edit_message_text(
             message,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     else:
         if problem_type == "vitamin":
@@ -1214,31 +1209,31 @@ async def start_problem_description(update: Update, context: ContextTypes.DEFAUL
                 "Опишите вашу проблему:"
             )
         
-        await update.message.reply_text(
+        await update.answer(
             message,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_cancel_keyboard()
+            parse_mode='MarkdownV2',
+            reply_markup=cancel_keyboard()
         )
     
     return WAITING_FOR_PROBLEM_DESCRIPTION
 
 
-async def handle_problem_description(update: Update, context: ContextTypes.DEFAULT_TYPE, description=None) -> None:
+async def handle_problem_description(update: Message, context: FSMContext, description=None) -> None:
     """Handle problem description"""
     if not description:
-        description = update.message.text
+        description = update.text
     
-    problem_type = context.user_data.get('problem_type', 'general')
+    problem_type = context.get('problem_type', 'general')
     
     # Clear state
-    if 'state' in context.user_data:
-        del context.user_data['state']
-    if 'problem_type' in context.user_data:
-        del context.user_data['problem_type']
+    if 'state' in context.get():
+        del context['state']
+    if 'problem_type' in context.get():
+        del context['problem_type']
     
     # Send typing action
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
+        chat_id=update.chat.id,
         action='typing'
     )
     
@@ -1253,9 +1248,9 @@ async def handle_problem_description(update: Update, context: ContextTypes.DEFAU
     
     # Send analysis
     await context.bot.send_message(
-        chat_id=update.effective_chat.id,
+        chat_id=update.chat.id,
         text=formatted_analysis,
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode='MarkdownV2'
     )
 
 
@@ -1276,23 +1271,23 @@ async def main() -> None:
     feedback_conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("feedback", start_feedback),
-            MessageHandler(filters.Regex(r'^📝 Обратная связь$'), start_feedback)
+            MessageHandler(F.text & ~F.command & F.text.startswith("📝 Обратная связь"), start_feedback)
         ],
         states={
-            FEEDBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback)]
+            FEEDBACK: [MessageHandler(F.text & ~F.command, handle_feedback)]
         },
         fallbacks=[CommandHandler("cancel", cancel_feedback)]
     )
     application.add_handler(feedback_conv_handler)
     
     # Add photo handler
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(F.photo, handle_photo))
     
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     
     # Add message handler (for text messages)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(F.text & ~F.command, handle_text_message))
     
     # Start the bot with polling
     logging.info("Bot started")
@@ -1314,6 +1309,7 @@ async def main() -> None:
         stop_signal.set_result(None)
     
     # Use the standard signal module for Windows compatibility
+    import signal
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     

@@ -1,47 +1,188 @@
-def format_vitamin_info(vitamin, detailed=False):
-    """Format vitamin information for display"""
-    if not vitamin:
-        return "Информация не найдена"
-    
-    if not detailed:
-        return f"*{vitamin['name']}*: {vitamin['short_description']}"
-    
-    text = f"*{vitamin['name']}*\n\n"
-    text += f"{vitamin['description']}\n\n"
-    
-    if 'benefits' in vitamin and vitamin['benefits']:
-        text += "*Польза для организма:*\n"
-        for benefit in vitamin['benefits'].split('\n'):
-            if benefit.strip():
-                text += f"• {benefit.strip()}\n"
-        text += "\n"
-    
-    if 'sources' in vitamin and vitamin['sources']:
-        text += "*Источники в продуктах:*\n"
-        for source in vitamin['sources'].split('\n'):
-            if source.strip():
-                text += f"• {source.strip()}\n"
-        text += "\n"
-    
-    if 'deficiency' in vitamin and vitamin['deficiency']:
-        text += "*При дефиците:*\n"
-        for symptom in vitamin['deficiency'].split('\n'):
-            if symptom.strip():
-                text += f"• {symptom.strip()}\n"
-        text += "\n"
-    
-    if 'overdose' in vitamin and vitamin['overdose']:
-        text += "*При избытке:*\n"
-        for symptom in vitamin['overdose'].split('\n'):
-            if symptom.strip():
-                text += f"• {symptom.strip()}\n"
-        text += "\n"
-    
-    if 'daily_intake' in vitamin and vitamin['daily_intake']:
-        text += f"*Суточная норма:* {vitamin['daily_intake']}\n\n"
-    
-    return text
+import os
+import re
+import time
+import random
+import logging
+import aiohttp
+import asyncio
+import datetime
+import traceback
+from typing import Dict, List, Union, Optional, Any
 
+from config import TEMP_DIR, MEDIA_DIR
+
+logger = logging.getLogger(__name__)
+
+async def download_image(url: str, save_path: str = None) -> Optional[str]:
+    try:
+        if not save_path:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            filename = f"temp_image_{int(time.time())}_{random.randint(1000, 9999)}.jpg"
+            save_path = os.path.join(TEMP_DIR, filename)
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to download image: {response.status}")
+                    return None
+                
+                with open(save_path, 'wb') as f:
+                    f.write(await response.read())
+                
+                logger.info(f"Image downloaded to {save_path}")
+                return save_path
+    except Exception as e:
+        logger.error(f"Error downloading image: {e}")
+        return None
+
+async def fetch_url(url: str) -> Optional[Dict]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to fetch URL: {response.status}")
+                    return None
+                
+                return await response.json()
+    except Exception as e:
+        logger.error(f"Error fetching URL: {e}")
+        return None
+
+def format_plant_info(plant_data: Dict) -> str:
+    if not plant_data:
+        return "Информация о растении не найдена."
+    
+    info = f"🌱 <b>{plant_data.get('name', 'Неизвестное растение')}</b>\n"
+    
+    if plant_data.get('scientific_name'):
+        info += f"<i>{plant_data['scientific_name']}</i>\n\n"
+    else:
+        info += "\n"
+    
+    if plant_data.get('description'):
+        info += f"{plant_data['description']}\n\n"
+    
+    if plant_data.get('type'):
+        info += f"<b>Тип:</b> {plant_data['type']}\n"
+    
+    care_tips = plant_data.get('care_tips', {})
+    if isinstance(care_tips, dict) and care_tips:
+        info += "\n<b>Рекомендации по уходу:</b>\n"
+        for key, value in care_tips.items():
+            if key == 'general':
+                info += f"{value}\n"
+            elif value:
+                info += f"• <b>{key.capitalize()}:</b> {value}\n"
+    elif isinstance(care_tips, str) and care_tips:
+        info += f"\n<b>Рекомендации по уходу:</b>\n{care_tips}\n"
+    
+    common_problems = plant_data.get('common_problems', [])
+    if common_problems:
+        info += "\n<b>Распространенные проблемы:</b>\n"
+        if isinstance(common_problems, list):
+            for problem in common_problems:
+                if problem:
+                    info += f"• {problem}\n"
+        else:
+            info += f"{common_problems}\n"
+    
+    if plant_data.get('benefits'):
+        info += f"\n<b>Польза:</b>\n{plant_data['benefits']}\n"
+    
+    return info
+
+def format_vitamin_info(vitamin_data: Dict) -> str:
+    if not vitamin_data:
+        return "Информация о витамине не найдена."
+    
+    info = f"💊 <b>{vitamin_data.get('name', 'Неизвестный витамин')}</b>\n\n"
+    
+    if vitamin_data.get('description'):
+        info += f"{vitamin_data['description']}\n\n"
+    
+    if vitamin_data.get('benefits'):
+        benefits = vitamin_data['benefits'].replace('\n', '\n• ')
+        info += f"<b>Польза:</b>\n• {benefits}\n\n"
+    
+    if vitamin_data.get('sources'):
+        sources = vitamin_data['sources'].replace('\n', '\n• ')
+        info += f"<b>Натуральные источники:</b>\n• {sources}\n\n"
+    
+    if vitamin_data.get('deficiency'):
+        deficiency = vitamin_data['deficiency'].replace('\n', '\n• ')
+        info += f"<b>Признаки дефицита:</b>\n• {deficiency}\n\n"
+    
+    if vitamin_data.get('daily_intake'):
+        info += f"<b>Рекомендуемая дневная доза:</b> {vitamin_data['daily_intake']}\n\n"
+    
+    if vitamin_data.get('overdose'):
+        overdose = vitamin_data['overdose'].replace('\n', '\n• ')
+        info += f"<b>Признаки передозировки:</b>\n• {overdose}\n"
+    
+    info += "\n<i>⚠️ Прежде чем принимать витаминные добавки, проконсультируйтесь с врачом.</i>"
+    
+    return info
+
+def extract_entities(text: str) -> Dict[str, List[str]]:
+    entities = {
+        'vitamins': [],
+        'plants': [],
+        'minerals': [],
+        'nutrients': []
+    }
+    
+    vitamin_pattern = r'витамин[а-я]* [ABCDEK]\d*'
+    plant_pattern = r'(алоэ|каланхоэ|фикус|кактус|суккулент|орхидея|фиалка|бегония|монстера|хлорофитум)'
+    mineral_pattern = r'(кальций|магний|цинк|железо|селен|йод|калий)'
+    nutrient_pattern = r'(белок|углевод|жир|клетчатка|антиоксидант)'
+    
+    vitamins = re.findall(vitamin_pattern, text.lower())
+    plants = re.findall(plant_pattern, text.lower())
+    minerals = re.findall(mineral_pattern, text.lower())
+    nutrients = re.findall(nutrient_pattern, text.lower())
+    
+    entities['vitamins'] = list(set(vitamins))
+    entities['plants'] = list(set(plants))
+    entities['minerals'] = list(set(minerals))
+    entities['nutrients'] = list(set(nutrients))
+    
+    return entities
+
+def clean_text(text: str) -> str:
+    return re.sub(r'[^\w\s\.\,\-\?\!]', '', text)
+
+def log_user_action(user_id, username, action, details=None):
+    try:
+        logger.info(f"USER ACTION: {user_id} (@{username}) - {action} - {details or ''}")
+    except Exception as e:
+        logger.error(f"Error logging user action: {e}")
+
+async def rate_limit(user_state, key, rate_limit_seconds=5):
+    current_time = time.time()
+    last_time = user_state.get(f"last_{key}_time", 0)
+    
+    if current_time - last_time < rate_limit_seconds:
+        return False
+    
+    user_state[f"last_{key}_time"] = current_time
+    return True
+
+def format_ai_response(response: str) -> str:
+    response = response.replace('**', '<b>').replace('__', '<i>')
+    response = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', response)
+    response = re.sub(r'__(.+?)__', r'<i>\1</i>', response)
+    
+    response = re.sub(r'\n\n+', '\n\n', response)
+    
+    section_pattern = r'\*\*([^:]+):\*\*'
+    sections = re.findall(section_pattern, response)
+    
+    for section in sections:
+        original = f"**{section}:**"
+        replacement = f"<b>{section}:</b>"
+        response = response.replace(original, replacement)
+    
+    return response
 
 def format_plant_tip(plant_tip, detailed=False):
     """Format plant care tip for display"""
@@ -83,7 +224,6 @@ def format_plant_tip(plant_tip, detailed=False):
         text += "\n"
     
     return text
-
 
 def format_faq(faq_id):
     """Return formatted FAQ text based on ID"""
@@ -155,14 +295,12 @@ def format_faq(faq_id):
     faq = faqs[faq_id]
     return f"*{faq['title']}*\n\n{faq['text']}"
 
-
 def is_vitamin_query(text):
     """Check if text likely contains a vitamin query"""
     text = text.lower()
     vitamin_keywords = ['витамин', 'минерал', 'кальций', 'железо', 'магний', 
                         'цинк', 'калий', 'натрий', 'фосфор', 'йод', 'селен']
     return any(keyword in text for keyword in vitamin_keywords)
-
 
 def is_plant_query(text):
     """Check if text likely contains a plant care query"""
@@ -171,11 +309,9 @@ def is_plant_query(text):
                      'скорлупа', 'кожура', 'гуща', 'заварка', 'компост']
     return any(keyword in text for keyword in plant_keywords)
 
-
 def get_file_url(file_path, bot_token):
     """Get full file URL from file path"""
     return f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
-
 
 def is_health_query(text):
     """Check if text likely contains a health query"""
@@ -184,14 +320,12 @@ def is_health_query(text):
                       'симптом', 'лечение', 'профилактика', 'иммунитет']
     return any(keyword in text for keyword in health_keywords)
 
-
 def is_ai_query(text):
     """Check if text likely contains an AI query"""
     text = text.lower()
     ai_keywords = ['ai', 'искусственный интеллект', 'анализ', 'помоги', 'посоветуй', 
                   'что делать', 'как быть', 'объясни', 'расскажи', 'консультант']
     return any(keyword in text for keyword in ai_keywords)
-
 
 def format_problem_analysis(analysis, problem_type):
     """Format problem analysis for display"""
@@ -211,7 +345,6 @@ def format_problem_analysis(analysis, problem_type):
     formatted_analysis = analysis.replace("**", "*")
     
     return header + formatted_analysis
-
 
 def clean_markdown(text):
     """Clean markdown formatting from text while preserving Telegram markdown

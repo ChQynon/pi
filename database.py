@@ -1,426 +1,263 @@
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+import os
 import logging
-from config import MONGO_URI, DB_NAME, VITAMINS_COLLECTION, PLANTS_COLLECTION, USERS_COLLECTION, FEEDBACK_COLLECTION
+import traceback
+import motor.motor_asyncio
 from datetime import datetime
+from typing import List, Dict, Any, Optional
+from bson.objectid import ObjectId
 
-# Sample data for when DB is not available
-SAMPLE_VITAMINS = [
-    {
-        "name": "Витамин C",
-        "short_description": "Антиоксидант, важен для иммунитета",
-        "description": "Витамин C (аскорбиновая кислота) - мощный антиоксидант, необходимый для роста и восстановления тканей организма.",
-        "benefits": "Укрепляет иммунитет\nУскоряет заживление ран\nУлучшает усвоение железа",
-        "sources": "Цитрусовые\nКиви\nШиповник\nСладкий перец\nБрокколи",
-        "deficiency": "Частые простуды\nМедленное заживление ран\nКровоточивость десен",
-        "overdose": "Расстройство желудка\nДиарея\nВздутие живота",
-        "daily_intake": "75-90 мг для взрослых"
-    },
-    {
-        "name": "Витамин D",
-        "short_description": "Важен для костей и иммунитета",
-        "description": "Витамин D регулирует усвоение кальция и фосфора, необходим для здоровья костей и иммунной системы.",
-        "benefits": "Укрепляет кости\nПоддерживает иммунитет\nРегулирует настроение",
-        "sources": "Жирная рыба\nЯичные желтки\nПеченка\nГрибы\nСинтезируется в коже под действием солнечных лучей",
-        "deficiency": "Рахит у детей\nОстеопороз\nМышечная слабость",
-        "overdose": "Тошнота\nРвота\nСлабость\nПочечные проблемы",
-        "daily_intake": "600-800 МЕ для взрослых"
-    }
-]
+from config import MONGO_URI, DB_NAME, PLANTS_COLLECTION, USERS_COLLECTION, FEEDBACK_COLLECTION
 
-SAMPLE_PLANTS = [
-    {
-        "waste_type": "Кофейная гуща",
-        "short_description": "Органическое удобрение для комнатных растений",
-        "description": "Кофейная гуща - отличное органическое удобрение, богатое азотом, фосфором и калием.",
-        "benefits": "Обогащает почву азотом\nОтпугивает вредителей\nУлучшает дренаж",
-        "application": "Высушить гущу\nСмешать с почвой (1:4)\nИспользовать как мульчу",
-        "suitable_plants": "Розы\nАзалии\nКамелии\nПапоротники\nЦитрусовые",
-        "precautions": "Не использовать для растений, предпочитающих щелочную почву\nНе перебарщивать - может закислить почву"
-    },
-    {
-        "waste_type": "Яичная скорлупа",
-        "short_description": "Натуральный источник кальция для растений",
-        "description": "Яичная скорлупа богата кальцием и другими микроэлементами, полезными для растений.",
-        "benefits": "Обогащает почву кальцием\nНейтрализует кислотность почвы\nОтпугивает слизней и улиток",
-        "application": "Промыть и высушить скорлупу\nИзмельчить в порошок\nДобавить в почву или компост",
-        "suitable_plants": "Томаты\nПерцы\nБаклажаны\nЦветущие растения\nКактусы",
-        "precautions": "Не использовать для растений, предпочитающих кислую почву\nПредварительно измельчать для лучшего усвоения"
-    }
-]
+logger = logging.getLogger(__name__)
 
 class Database:
-    """Database class for interacting with MongoDB"""
-    def __init__(self):
+    def __init__(self, mongo_uri=None, db_name=None):
+        self.mongo_uri = mongo_uri or MONGO_URI
+        self.db_name = db_name or DB_NAME
+        
         try:
-            self.client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-            self.client.server_info()  # Will raise exception if cannot connect
-            
-            self.db = self.client[DB_NAME]
-            self.vitamins = self.db[VITAMINS_COLLECTION]
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(self.mongo_uri)
+            self.db = self.client[self.db_name]
             self.plants = self.db[PLANTS_COLLECTION]
             self.users = self.db[USERS_COLLECTION]
             self.feedback = self.db[FEEDBACK_COLLECTION]
-            
-            # Create indexes for faster lookups
-            self.vitamins.create_index("name")
-            self.plants.create_index("name")
-            self.plants.create_index("waste_type")
-            self.users.create_index("user_id", unique=True)
-            
-            logging.info("Connected to MongoDB")
-        except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-            logging.error(f"Could not connect to MongoDB: {e}")
-            # Continue without database - app will handle missing database gracefully
-            self.client = None
-            self.db = None
-            self.vitamins = None
-            self.plants = None
-            self.users = None
-            self.feedback = None
-    
-    def register_user(self, user_id, username, first_name=None):
-        """Register new user or update existing user info"""
-        if not self.users:
-            logging.warning("Database not available - skipping user registration")
-            return
-        
-        try:
-            user_data = {
-                "user_id": user_id,
-                "username": username,
-                "first_name": first_name or "",
-                "last_interaction": datetime.now(),
-                "interaction_count": 1,
-                "favorite_sections": []
-            }
-            
-            # Update user if exists, insert if not
-            result = self.users.update_one(
-                {"user_id": user_id},
-                {"$set": user_data, "$setOnInsert": {"registered_at": datetime.now()}},
-                upsert=True
-            )
-            
-            if result.upserted_id:
-                logging.info(f"New user registered: {username} (ID: {user_id})")
-            else:
-                logging.info(f"User info updated: {username} (ID: {user_id})")
+            logger.info(f"Connected to database: {self.db_name}")
         except Exception as e:
-            logging.error(f"Error registering user: {e}")
+            logger.error(f"Failed to connect to database: {e}")
+            logger.error(traceback.format_exc())
+            raise
     
-    def update_user_interaction(self, user_id, section, query=None):
-        """Update user interaction metrics"""
-        if not self.users:
-            logging.warning("Database not available - skipping user interaction update")
-            return
-        
+    async def add_plant(self, plant_data: Dict[str, Any]) -> str:
         try:
-            update_data = {
-                "last_interaction": datetime.now(),
-                "last_section": section
-            }
-            
-            # Increment interaction count
-            self.users.update_one(
-                {"user_id": user_id},
-                {
-                    "$set": update_data,
-                    "$inc": {"interaction_count": 1},
-                    "$push": {"interactions": {
-                        "timestamp": datetime.now(),
-                        "section": section,
-                        "query": query
-                    }}
-                }
-            )
-            
-            # Update favorite sections counter
-            self.users.update_one(
-                {"user_id": user_id, "favorite_sections.section": section},
-                {"$inc": {"favorite_sections.$.count": 1}}
-            )
-            
-            # If section not in favorite_sections, add it
-            self.users.update_one(
-                {"user_id": user_id, "favorite_sections.section": {"$ne": section}},
-                {"$push": {"favorite_sections": {"section": section, "count": 1}}}
-            )
+            result = await self.plants.insert_one(plant_data)
+            logger.info(f"Added plant: {plant_data.get('name', 'unknown')}")
+            return str(result.inserted_id)
         except Exception as e:
-            logging.error(f"Error updating user interaction: {e}")
-    
-    def save_feedback(self, user_id, feedback_text):
-        """Save user feedback"""
-        if not self.feedback:
-            logging.warning("Database not available - skipping feedback save")
-            return False
-        
-        try:
-            feedback_data = {
-                "user_id": user_id,
-                "feedback": feedback_text,
-                "timestamp": datetime.now()
-            }
-            
-            self.feedback.insert_one(feedback_data)
-            logging.info(f"Feedback saved from user {user_id}")
-            return True
-        except Exception as e:
-            logging.error(f"Error saving feedback: {e}")
-            return False
-    
-    def get_vitamin_by_name(self, name):
-        """Get vitamin information by name"""
-        if not self.vitamins:
-            logging.warning("Database not available - cannot get vitamin info")
-            return None
-        
-        try:
-            return self.vitamins.find_one({"name": name})
-        except Exception as e:
-            logging.error(f"Error retrieving vitamin: {e}")
+            logger.error(f"Error adding plant: {e}")
+            logger.error(traceback.format_exc())
             return None
     
-    def get_all_vitamins(self):
-        """Get all vitamins"""
-        if not self.vitamins:
-            logging.warning("Database not available - cannot get all vitamins")
-            return []
-        
+    async def get_plant(self, plant_id: str) -> Dict[str, Any]:
         try:
-            return list(self.vitamins.find())
-        except Exception as e:
-            logging.error(f"Error retrieving all vitamins: {e}")
-            return []
-    
-    def search_vitamins(self, query):
-        """Search vitamins by keyword"""
-        if not self.vitamins:
-            logging.warning("Database not available - cannot search vitamins")
-            return []
-        
-        try:
-            # Create a regex pattern for case-insensitive search
-            pattern = {"$regex": query, "$options": "i"}
-            
-            # Search in name, aliases and description
-            result = self.vitamins.find({
-                "$or": [
-                    {"name": pattern},
-                    {"aliases": pattern},
-                    {"short_description": pattern},
-                    {"description": pattern}
-                ]
-            })
-            
-            return list(result)
-        except Exception as e:
-            logging.error(f"Error searching vitamins: {e}")
-            return []
-    
-    def get_plant_tip_by_waste(self, waste_type):
-        """Get plant care tip by waste type"""
-        if not self.plants:
-            logging.warning("Database not available - cannot get plant care tip")
-            return None
-        
-        try:
-            return self.plants.find_one({"waste_type": {"$regex": waste_type, "$options": "i"}})
-        except Exception as e:
-            logging.error(f"Error retrieving plant care tip: {e}")
-            return None
-    
-    def get_all_plant_tips(self):
-        """Get all plant care tips"""
-        if not self.plants:
-            logging.warning("Database not available - cannot get all plant care tips")
-            return []
-        
-        try:
-            return list(self.plants.find({"waste_type": {"$exists": True}}))
-        except Exception as e:
-            logging.error(f"Error retrieving all plant care tips: {e}")
-            return []
-    
-    def search_plant_tips(self, query):
-        """Search plant care tips by keyword"""
-        if not self.plants:
-            logging.warning("Database not available - cannot search plant care tips")
-            return []
-        
-        try:
-            # Create a regex pattern for case-insensitive search
-            pattern = {"$regex": query, "$options": "i"}
-            
-            # Search in waste_type, short_description and description
-            result = self.plants.find({
-                "$and": [
-                    {"waste_type": {"$exists": True}},  # Make sure it's a waste tip
-                    {"$or": [
-                        {"waste_type": pattern},
-                        {"short_description": pattern},
-                        {"description": pattern},
-                        {"application": pattern},
-                        {"suitable_plants": pattern}
-                    ]}
-                ]
-            })
-            
-            return list(result)
-        except Exception as e:
-            logging.error(f"Error searching plant care tips: {e}")
-            return []
-            
-    # New methods for plant database
-    
-    def get_plant_by_name(self, plant_name):
-        """Get plant information by name."""
-        if not self.plants:
-            logging.warning("Database not available - cannot get plant info")
-            return None
-        
-        try:
-            # Try to find plant by exact name
-            plant = self.plants.find_one({"name": plant_name})
-            
-            # If not found, try case-insensitive search
-            if not plant:
-                pattern = {"$regex": f"^{plant_name}$", "$options": "i"}
-                plant = self.plants.find_one({"name": pattern})
-                
-            # If still not found, try partial match
-            if not plant:
-                pattern = {"$regex": plant_name, "$options": "i"}
-                plant = self.plants.find_one({"name": pattern})
-                
+            plant = await self.plants.find_one({"_id": ObjectId(plant_id)})
             return plant
         except Exception as e:
-            logging.error(f"Error retrieving plant: {e}")
+            logger.error(f"Error getting plant {plant_id}: {e}")
             return None
     
-    def save_plant(self, plant_data):
-        """Save or update plant information in the database."""
-        # Check if plant already exists
-        existing_plant = self.plants.find_one({"name": plant_data["name"]})
-        
-        if existing_plant:
-            # Update existing plant
-            self.plants.update_one(
-                {"name": plant_data["name"]},
-                {"$set": plant_data}
+    def get_plant_by_name(self, name: str) -> Dict[str, Any]:
+        try:
+            return self.plants.find_one({"name": name})
+        except Exception as e:
+            logger.error(f"Error getting plant by name {name}: {e}")
+            return None
+    
+    async def update_plant(self, plant_id, data: Dict[str, Any]) -> bool:
+        try:
+            result = await self.plants.update_one(
+                {"_id": ObjectId(plant_id)},
+                {"$set": data}
             )
-            return existing_plant["_id"]
-        else:
-            # Insert new plant
-            result = self.plants.insert_one(plant_data)
-            return result.inserted_id
-    
-    def get_all_plants(self):
-        """Get all plants from the database."""
-        if not self.plants:
-            logging.warning("Database not available - cannot get all plants")
-            return []
-        
-        try:
-            # Get all documents that have name but not waste_type
-            # This differentiates plants from waste tips
-            return list(self.plants.find({
-                "name": {"$exists": True},
-                "waste_type": {"$exists": False}
-            }))
+            logger.info(f"Updated plant {plant_id}: {result.modified_count} document(s) modified")
+            return result.modified_count > 0
         except Exception as e:
-            logging.error(f"Error retrieving all plants: {e}")
-            return []
-    
-    def update_plant(self, plant_id, update_data):
-        """Update an existing plant in the database"""
-        if not self.plants:
-            logging.warning("Database not available - cannot update plant")
-            return False
-        
-        try:
-            # Add last_updated timestamp
-            update_data["last_updated"] = datetime.now()
-            
-            # Update plant
-            result = self.plants.update_one(
-                {"_id": plant_id},
-                {"$set": update_data}
-            )
-            
-            if result.modified_count > 0:
-                logging.info(f"Updated plant: {update_data.get('name', plant_id)}")
-                return True
-            else:
-                return False
-        except Exception as e:
-            logging.error(f"Error updating plant: {e}")
+            logger.error(f"Error updating plant {plant_id}: {e}")
             return False
     
-    def search_plants(self, query):
-        """Search plants by keyword"""
-        if not self.plants:
-            logging.warning("Database not available - cannot search plants")
-            return []
-        
+    async def delete_plant(self, plant_id: str) -> bool:
         try:
-            # Create a regex pattern for case-insensitive search
-            pattern = {"$regex": query, "$options": "i"}
-            
-            # Search in name, scientific_name and description
-            # Exclude waste tips
-            result = self.plants.find({
-                "$and": [
-                    {"waste_type": {"$exists": False}},  # Exclude waste tips
-                    {"$or": [
-                        {"name": pattern},
-                        {"scientific_name": pattern},
-                        {"description": pattern},
-                        {"care_tips": pattern}
-                    ]}
-                ]
-            })
-            
-            return list(result)
+            result = await self.plants.delete_one({"_id": ObjectId(plant_id)})
+            logger.info(f"Deleted plant {plant_id}: {result.deleted_count} document(s) deleted")
+            return result.deleted_count > 0
         except Exception as e:
-            logging.error(f"Error searching plants: {e}")
+            logger.error(f"Error deleting plant {plant_id}: {e}")
+            return False
+    
+    async def search_plants(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        try:
+            cursor = self.plants.find(
+                {"$text": {"$search": query}},
+                {"score": {"$meta": "textScore"}}
+            ).sort([("score", {"$meta": "textScore"})]).limit(limit)
+            
+            return await cursor.to_list(length=limit)
+        except Exception as e:
+            logger.error(f"Error searching plants with query '{query}': {e}")
             return []
     
-    def increment_plant_image_count(self, plant_name):
-        """Increment the count of images processed for a plant"""
-        if not self.plants:
-            logging.warning("Database not available - cannot update plant image count")
-            return False
-        
+    async def get_all_plants(self, limit: int = 100) -> List[Dict[str, Any]]:
         try:
-            result = self.plants.update_one(
-                {"name": plant_name},
-                {"$inc": {"image_count": 1}}
+            cursor = self.plants.find().limit(limit)
+            return await cursor.to_list(length=limit)
+        except Exception as e:
+            logger.error(f"Error getting all plants: {e}")
+            return []
+    
+    async def add_user(self, user_data: Dict[str, Any]) -> str:
+        try:
+            user_data["created_at"] = datetime.utcnow()
+            user_data["last_active"] = datetime.utcnow()
+            
+            existing_user = await self.users.find_one({"user_id": user_data["user_id"]})
+            
+            if existing_user:
+                await self.users.update_one(
+                    {"user_id": user_data["user_id"]},
+                    {"$set": {
+                        "last_active": datetime.utcnow(),
+                        "username": user_data.get("username"),
+                        "first_name": user_data.get("first_name"),
+                        "last_name": user_data.get("last_name")
+                    }}
+                )
+                return str(existing_user["_id"])
+            
+            result = await self.users.insert_one(user_data)
+            logger.info(f"Added user: {user_data.get('username', user_data.get('user_id'))}")
+            return str(result.inserted_id)
+        except Exception as e:
+            logger.error(f"Error adding user: {e}")
+            return None
+    
+    async def get_user(self, user_id: int) -> Dict[str, Any]:
+        try:
+            user = await self.users.find_one({"user_id": user_id})
+            return user
+        except Exception as e:
+            logger.error(f"Error getting user {user_id}: {e}")
+            return None
+    
+    async def update_user(self, user_id: int, data: Dict[str, Any]) -> bool:
+        try:
+            data["last_active"] = datetime.utcnow()
+            
+            result = await self.users.update_one(
+                {"user_id": user_id},
+                {"$set": data}
             )
             
             return result.modified_count > 0
         except Exception as e:
-            logging.error(f"Error incrementing plant image count: {e}")
+            logger.error(f"Error updating user {user_id}: {e}")
             return False
     
-    def update_plant_extra_data(self, plant_name, field, value):
-        """Update a specific field in the plant's extra_data."""
-        self.plants.update_one(
-            {"name": plant_name},
-            {"$set": {f"extra_data.{field}": value}}
-        )
-        
-    def search_plants_by_keyword(self, keyword):
-        """Search for plants by keyword in name or description."""
-        regex = {"$regex": keyword, "$options": "i"}
-        return list(self.plants.find({
-            "$or": [
-                {"name": regex},
-                {"scientific_name": regex},
-                {"description": regex}
-            ]
-        }))
-
-    def delete_plant(self, plant_name):
-        """Delete a plant from the database."""
-        self.plants.delete_one({"name": plant_name}) 
+    async def add_user_interaction(self, user_id: int, interaction_type: str, data: Dict[str, Any] = None) -> bool:
+        try:
+            if data is None:
+                data = {}
+                
+            interaction = {
+                "type": interaction_type,
+                "timestamp": datetime.utcnow(),
+                **data
+            }
+            
+            result = await self.users.update_one(
+                {"user_id": user_id},
+                {
+                    "$push": {"interactions": interaction},
+                    "$set": {"last_active": datetime.utcnow()}
+                }
+            )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error adding interaction for user {user_id}: {e}")
+            return False
+    
+    async def add_user_session(self, user_id: int, session_data: Dict[str, Any] = None) -> str:
+        try:
+            if session_data is None:
+                session_data = {}
+                
+            session = {
+                "started_at": datetime.utcnow(),
+                "last_activity": datetime.utcnow(),
+                "session_id": str(ObjectId()),
+                **session_data
+            }
+            
+            result = await self.users.update_one(
+                {"user_id": user_id},
+                {
+                    "$push": {"sessions": session},
+                    "$set": {"current_session": session["session_id"], "last_active": datetime.utcnow()}
+                }
+            )
+            
+            if result.modified_count > 0:
+                return session["session_id"]
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error adding session for user {user_id}: {e}")
+            return None
+    
+    async def update_user_session(self, user_id: int, session_id: str, data: Dict[str, Any]) -> bool:
+        try:
+            data["last_activity"] = datetime.utcnow()
+            
+            result = await self.users.update_one(
+                {"user_id": user_id, "sessions.session_id": session_id},
+                {
+                    "$set": {
+                        "sessions.$.last_activity": datetime.utcnow(),
+                        **{f"sessions.$.{k}": v for k, v in data.items()},
+                        "last_active": datetime.utcnow()
+                    }
+                }
+            )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating session {session_id} for user {user_id}: {e}")
+            return False
+    
+    async def add_feedback(self, feedback_data: Dict[str, Any]) -> str:
+        try:
+            feedback_data["created_at"] = datetime.utcnow()
+            
+            result = await self.feedback.insert_one(feedback_data)
+            logger.info(f"Added feedback from user: {feedback_data.get('user_id', 'unknown')}")
+            return str(result.inserted_id)
+        except Exception as e:
+            logger.error(f"Error adding feedback: {e}")
+            return None
+    
+    async def get_all_feedback(self, limit: int = 100) -> List[Dict[str, Any]]:
+        try:
+            cursor = self.feedback.find().sort("created_at", -1).limit(limit)
+            return await cursor.to_list(length=limit)
+        except Exception as e:
+            logger.error(f"Error getting all feedback: {e}")
+            return []
+            
+    async def get_user_feedback(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        try:
+            cursor = self.feedback.find({"user_id": user_id}).sort("created_at", -1).limit(limit)
+            return await cursor.to_list(length=limit)
+        except Exception as e:
+            logger.error(f"Error getting feedback for user {user_id}: {e}")
+            return []
+    
+    async def create_indexes(self):
+        try:
+            await self.plants.create_index([("name", "text"), ("scientific_name", "text"), ("description", "text")])
+            await self.users.create_index("user_id", unique=True)
+            await self.feedback.create_index([("user_id", 1), ("created_at", -1)])
+            
+            logger.info("Created database indexes")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating indexes: {e}")
+            return False
+    
+    async def get_plant_suggestions(self, partial_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+        try:
+            regex = f".*{partial_name}.*"
+            cursor = self.plants.find({"name": {"$regex": regex, "$options": "i"}}).limit(limit)
+            
+            return await cursor.to_list(length=limit)
+        except Exception as e:
+            logger.error(f"Error getting plant suggestions for '{partial_name}': {e}")
+            return [] 
